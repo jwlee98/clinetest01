@@ -114,21 +114,44 @@ def run(argv=None, save_main_session=True):
         '--explicit_header',
         default=None,
         help='(Optional) Explicit header string. If provided, overrides automatic GCS header extraction.')
+    # --project 인자를 명시적으로 추가하여 known_args에서 사용할 수 있도록 함
+    parser.add_argument(
+        '--project',
+        default=None, # DirectRunner 사용 시 명시적으로 필요할 수 있음
+        help='GCP Project ID. Required by GCS client for header extraction if not inferable from ADC, '
+             'and by DataflowRunner.')
 
-    # 파이프라인 옵션 (runner, project, region 등)은 Beam SDK가 자동으로 파싱합니다.
+    # 파이프라인 옵션 (runner, region 등)은 Beam SDK가 나머지 pipeline_args에서 파싱합니다.
     known_args, pipeline_args = parser.parse_known_args(argv)
     
+    # pipeline_args에 --project가 여전히 포함되어 DataflowRunner가 사용할 수 있도록 함
+    # 만약 known_args.project가 None이 아니고, pipeline_args에 --project가 없다면 추가해줄 수도 있음
+    # (하지만 보통 사용자가 --project를 한 번만 제공하므로 pipeline_args에 이미 존재)
+
     pipeline_options = PipelineOptions(pipeline_args)
     # Dataflow에서 main 세션의 전역 상태를 직렬화하기 위해 필요합니다.
     pipeline_options.view_as(SetupOptions).save_main_session = save_main_session
     
-    # GCP 프로젝트 ID 가져오기 (GCS 헤더 추출 및 Dataflow 작업 실행에 필요)
-    gcp_project_id = pipeline_options.view_as(PipelineOptions).project
-    if not gcp_project_id:
-        # DirectRunner로 GCS 접근 시 --project 인자가 필요할 수 있습니다.
-        # DataflowRunner는 일반적으로 서비스 계정이나 환경에서 프로젝트를 유추합니다.
-        logging.warning("GCP project ID not explicitly set in pipeline options. "
-                        "Ensure it's available via environment or ADC for GCS operations.")
+    # GCS 헤더 추출에 사용할 GCP 프로젝트 ID 결정
+    # 1. 명시적으로 제공된 --project 인자 사용
+    # 2. (DataflowRunner의 경우) pipeline_options에서 가져오기 시도 (GoogleCloudOptions)
+    # 3. ADC 환경에서 유추 (storage.Client(project=None) 사용 시)
+    gcp_project_for_header_extraction = known_args.project
+    if not gcp_project_for_header_extraction:
+        try:
+            # DataflowRunner의 경우 GoogleCloudOptions에서 project를 가져올 수 있음
+            from apache_beam.options.pipeline_options import GoogleCloudOptions
+            gcp_project_for_header_extraction = pipeline_options.view_as(GoogleCloudOptions).project
+        except AttributeError:
+            logging.warning("Could not infer GCP project from pipeline options for header extraction. "
+                            "Will rely on GCS client's default project (ADC). "
+                            "Consider providing --project argument if issues occur with DirectRunner and GCS.")
+    
+    if gcp_project_for_header_extraction:
+        logging.info(f"Using GCP project '{gcp_project_for_header_extraction}' for GCS header extraction if needed.")
+    else:
+        logging.info("No GCP project explicitly specified for GCS header extraction; GCS client will use default.")
+
 
     # 헤더 결정 로직: 명시적 헤더 > 자동 추출 헤더
     final_header_to_use = known_args.explicit_header
@@ -136,7 +159,7 @@ def run(argv=None, save_main_session=True):
         logging.info("No explicit_header provided. Attempting to auto-extract header from GCS...")
         final_header_to_use = extract_header_from_gcs_before_pipeline(
             known_args.input_pattern,
-            gcp_project_id # GCS 클라이언트에 프로젝트 ID 전달
+            gcp_project_for_header_extraction # GCS 클라이언트에 프로젝트 ID 전달
         )
         if not final_header_to_use:
             # 헤더를 결정할 수 없으면 파이프라인을 진행하기 어려움
